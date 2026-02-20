@@ -2,66 +2,88 @@
 const Badge = require('../models/Badge');
 
 /**
- * Simple badge rules:
- * - first_correct : awarded when user gets their first correct attempt (no need for immediate creation)
- * - score_100 : awarded when user.points >= 100
- *
- * checkBadges(user) will mutate user.badges (push ObjectId) but does NOT save the user.
- * It ensures badge docs exist in DB, and returns an array of awarded badge ids (newly awarded).
+ * Check badges for a user and award them when appropriate.
+ * Defensive: validates badge payloads before creating/saving.
  */
-async function checkBadges(user) {
-  if (!user) return [];
-  const awarded = [];
 
-  // helper: ensure badge exists (by code)
-  async function ensureBadge(code, title, description) {
-    let badge = await Badge.findOne({ code });
-    if (!badge) {
-      badge = new Badge({ code, title, description });
-      await badge.save();
-    }
-    return badge;
+async function createBadgeIfNotExists(badgeData) {
+  if (!badgeData || typeof badgeData !== 'object') {
+    throw new Error('Invalid badgeData');
+  }
+  const { name, description = '', icon = '', criteria = {} } = badgeData;
+
+  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+    throw new Error('Badge validation failed: name is required.');
   }
 
-  try {
-    // first_correct: award if user has at least one correct attempt but no badge yet
-    // For simplicity: if user.mastery has any value > 0 (meaning they answered something correctly at some point),
-    // and user.badges doesn't include 'first_correct', then award it.
-    const firstBadge = await ensureBadge('first_correct', 'First Win', 'Awarded for first correct answer');
+  // Try to find an existing badge with same name
+  let badge = await Badge.findOne({ name: name.trim() });
+  if (!badge) {
+    badge = new Badge({
+      name: name.trim(),
+      description: description || '',
+      icon: icon || '',
+      criteria
+    });
+    await badge.save();
+  }
+  return badge;
+}
 
-    // check if user already has it
-    const hasFirst = Array.isArray(user.badges) && user.badges.some(b => String(b) === String(firstBadge._id));
-    // decide awarding condition: we cannot query attempts here (controller already knows 'correct' at time of attempt),
-    // but the attempt controller calls checkBadges after a successful attempt, so we can award when user doesn't have it yet.
-    if (!hasFirst) {
-      // The controller calls this after an attempt; if the user has any mastery > 0 we assume they had a correct attempt.
-      const masteryVals = (user.mastery && typeof user.mastery.get === 'function')
-        ? Array.from(user.mastery.values())
-        : (user.mastery ? Object.values(user.mastery) : []);
-      const anyMastery = masteryVals.some(v => Number(v) > 0);
-      if (anyMastery) {
-        user.badges = user.badges || [];
-        user.badges.push(firstBadge._id);
-        awarded.push(firstBadge._id);
+/**
+ * Check user state for badge awarding.
+ * user is a mongoose doc instance (or plain object with badges array)
+ */
+async function checkBadges(user) {
+  try {
+    // example rules (expand as needed)
+    const awarded = [];
+
+    // Guard: ensure user object exists
+    if (!user) return awarded;
+
+    // Example badge: 'First Attempt' -> awarded if user has at least 1 attempt
+    // (This function should be called after the user has been updated)
+    // NOTE: adapt names/criteria as needed for your app logic
+
+    // Simple rule: if user.points >= 10 => award "Rising Star"
+    if ((user.points || 0) >= 10 && !(user.badges || []).some(b => b.name === 'Rising Star')) {
+      const b = await createBadgeIfNotExists({
+        name: 'Rising Star',
+        description: 'Earned 10 points',
+        icon: 'star',
+        criteria: { points: 10 }
+      });
+      // add badge id to user.badges if not present (user may be a doc)
+      if (user.badges && !user.badges.includes(b._id)) {
+        user.badges.push(b._id);
       }
+      awarded.push(b);
     }
 
-    // score_100: award when user.points >= 100
-    const scoreBadge = await ensureBadge('score_100', 'Century', 'Reach 100 points');
-    const hasScore = Array.isArray(user.badges) && user.badges.some(b => String(b) === String(scoreBadge._id));
-    if (!hasScore && Number(user.points || 0) >= 100) {
-      user.badges = user.badges || [];
-      user.badges.push(scoreBadge._id);
-      awarded.push(scoreBadge._id);
+    // Another example badge: Master of Arithmetic (if mastery.arithmetic >= 80)
+    const masteryMap = user.mastery || (user.toObject ? user.toObject().mastery : {});
+    const arithmeticMastery = masteryMap && (masteryMap.arithmetic || masteryMap.get && masteryMap.get('arithmetic'));
+    if (arithmeticMastery >= 80 && !(user.badges || []).some(b => b.name === 'Master of Arithmetic')) {
+      const b = await createBadgeIfNotExists({
+        name: 'Master of Arithmetic',
+        description: 'High mastery of arithmetic',
+        icon: 'calculator',
+        criteria: { concept: 'arithmetic', mastery: 80 }
+      });
+      if (user.badges && !user.badges.includes(b._id)) user.badges.push(b._id);
+      awarded.push(b);
     }
 
     return awarded;
   } catch (err) {
     console.error('badgeService.checkBadges error:', err && err.message ? err.message : err);
+    // don't throw: calling code should continue (we log the issue)
     return [];
   }
 }
 
 module.exports = {
-  checkBadges
+  checkBadges,
+  createBadgeIfNotExists
 };
