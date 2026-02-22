@@ -5,76 +5,115 @@ const Question = require('../models/Question');
 const User = require('../models/User');
 const adaptiveService = require('../services/adaptiveService');
 const badgeService = require('../services/badgeService');
+const { calculateReward } = require('../services/rewardService');
 
 exports.submitAttempt = async (req, res) => {
-  const { questionId, givenAnswer } = req.body;
+  const { questionId, givenAnswer, timeSeconds = 0 } = req.body;
 
   try {
-    // Basic validation
     if (!questionId) return res.status(400).json({ message: 'questionId is required' });
-
-    // Validate ObjectId format to avoid uncaught CastError
     if (!mongoose.Types.ObjectId.isValid(questionId)) {
       return res.status(400).json({ message: 'questionId is not a valid id' });
     }
 
-    const question = await Question.findById(questionId);
-    if (!question) return res.status(404).json({ message: 'Question not found' });
+    // Start a session for atomic updates
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // Evaluate correctness
+    // Fetch question inside transaction context
+    const question = await Question.findById(questionId).session(session);
+    if (!question) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Question not found' });
+    }
+
+    // Evaluate correctness (same logic as before, but defensive)
     let correct = false;
     if (question.type === 'mcq') {
       const correctChoice = (question.choices || []).find(c => c.correct);
-      correct = !!(correctChoice && correctChoice.text === givenAnswer);
+      correct = !!(correctChoice && String(correctChoice.text).trim() === String(givenAnswer || '').trim());
     } else {
       correct = String(question.answer || '').trim().toLowerCase() === String(givenAnswer || '').trim().toLowerCase();
     }
 
-    const pointsEarned = correct ? (question.points || 0) : 0;
+    // Load fresh user doc inside session
+    const user = await User.findById(req.user._id).session(session);
+    if (!user) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(500).json({ message: 'User not found (during attempt)' });
+    }
 
-    // Create attempt doc
-    const attempt = new Attempt({
-      student: req.user._id,
+    // calculate points using centralized service
+    const pointsToAward = calculateReward({
+      correct,
+      difficulty: question.difficulty || 1,
+      timeSeconds,
+      base: question.points || 10,
+      streak: user.currentStreak || 0
+    });
+
+    // Create attempt (audit)
+    const attemptDoc = await Attempt.create([{
+      student: user._id,
       question: question._id,
       correct,
       givenAnswer,
-      pointsEarned
-    });
-    await attempt.save();
+      pointsEarned: pointsToAward,
+      timeSeconds
+    }], { session });
 
-    // Update user (retrieve fresh doc)
-    const user = await User.findById(req.user._id);
-    if (!user) {
-      // very unlikely, but handle gracefully
-      return res.status(500).json({ message: 'User not found when updating after attempt' });
+    // Update user points/level
+    if (pointsToAward && pointsToAward > 0) {
+      user.points = (user.points || 0) + pointsToAward;
+      user.level = Math.floor((user.points) / 100) + 1;
+      // update streak if you track it simply
+      user.currentStreak = correct ? ((user.currentStreak || 0) + 1) : 0;
+    } else {
+      // reset streak on wrong answer
+      user.currentStreak = 0;
     }
 
-    if (pointsEarned) {
-      user.points = (user.points || 0) + pointsEarned;
-      user.level = Math.floor(user.points / 100) + 1;
-    }
-
-    // Update mastery per concept (adaptive service should be defensive)
+    // Update mastery (defensive - external service)
     try {
-      await adaptiveService.updateMastery(user, question.concepts || [], correct, question.difficulty || 1);
+      await adaptiveService.updateMastery(user, question.concepts || [], correct, question.difficulty || 1, { session });
     } catch (mErr) {
-      console.error('updateMastery error (non-fatal):', mErr && mErr.message ? mErr.message : mErr);
+      // Non-fatal: log and continue
+      console.error('adaptiveService.updateMastery error (non-fatal):', mErr && mErr.message ? mErr.message : mErr);
     }
 
-    // Check badges (defensive; function returns awarded badges or empty array)
+    // Badge checks (defensive)
+    let awardedBadges = [];
     try {
-      const awarded = await badgeService.checkBadges(user);
-      // awarded badges already pushed by checkBadges if implemented that way
+      awardedBadges = (await badgeService.checkBadges(user)) || [];
     } catch (bErr) {
       console.error('badgeService.checkBadges error (non-fatal):', bErr && bErr.message ? bErr.message : bErr);
     }
 
-    await user.save();
+    // Persist user changes within session
+    await user.save({ session });
 
-    res.json({ attempt, user: { id: user._id, name: user.name, points: user.points, level: user.level, mastery: user.mastery, badges: user.badges } });
+    // commit transaction
+    await session.commitTransaction();
+    session.endSession();
+
+    // Return freshly created attempt (attemptDoc is array)
+    return res.json({
+      attempt: attemptDoc[0],
+      user: { id: user._id, name: user.name, points: user.points, level: user.level, mastery: user.mastery, badges: user.badges },
+      awardedBadges
+    });
   } catch (err) {
     console.error('submitAttempt error:', err && err.stack ? err.stack : err);
-    res.status(500).json({ message: 'Server error' });
+    try {
+      // ensure session aborted if still alive
+      if (err && err.session) {
+        await err.session.abortTransaction();
+        err.session.endSession();
+      }
+    } catch (e) { /* ignore */ }
+    return res.status(500).json({ message: 'Server error' });
   }
 };
 

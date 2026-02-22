@@ -1,14 +1,8 @@
 // controllers/questionController.js
-
 const Question = require('../models/Question');
 const Lesson = require('../models/Lesson');
 const adaptiveService = require('../services/adaptiveService');
 
-/**
- * Create a question (lecturer)
- * - body: { text, type, choices, answer, difficulty, concepts, lessonId, points }
- * - If lessonId provided, we push question._id into the lesson.questions array.
- */
 exports.createQuestion = async (req, res) => {
   const { text, type, choices, answer, difficulty, concepts, lessonId, points } = req.body;
   try {
@@ -19,7 +13,6 @@ exports.createQuestion = async (req, res) => {
       await Lesson.findByIdAndUpdate(lessonId, { $push: { questions: question._id } });
     }
 
-    // Return full question to lecturers (they need correct flags); frontends for students use /questions/next
     return res.json(question);
   } catch (err) {
     console.error('createQuestion error:', err && err.stack ? err.stack : err);
@@ -27,9 +20,6 @@ exports.createQuestion = async (req, res) => {
   }
 };
 
-/**
- * Get one question (raw) - used for editing/review (lecturer)
- */
 exports.getQuestion = async (req, res) => {
   try {
     const q = await Question.findById(req.params.id);
@@ -41,59 +31,49 @@ exports.getQuestion = async (req, res) => {
   }
 };
 
-/**
- * Get next adaptive question for the requesting user (student)
- * - Optional query: ?lessonId=xxxxx to restrict to a lesson's questions
- * - Returns a "safe" question object with:
- *     - no `answer` field
- *     - choices array with only `text` (no `correct` flags)
- */
 exports.getNextQuestion = async (req, res) => {
   try {
-    // Optionally filter by lessonId if frontend wants lesson-specific practice
     const { lessonId } = req.query;
-
     let questionsQuery = Question.find();
 
     if (lessonId) {
-      // if lessonId is provided, fetch questions that reference that lesson via Lesson model,
-      // or assume Question has a lessonId field. Adjust depending on your schema.
-      // Here we try a safe approach: if Lesson exists and has questions array, fetch those.
-      const LessonModel = require('../models/Lesson');
-      const lesson = await LessonModel.findById(lessonId).lean();
+      const lesson = await Lesson.findById(lessonId).lean();
       if (lesson && Array.isArray(lesson.questions) && lesson.questions.length > 0) {
         questionsQuery = Question.find({ _id: { $in: lesson.questions } });
       } else {
-        // fallback: empty - leads to 404
-        questionsQuery = Question.find({ _id: null });
+        questionsQuery = Question.find({ _id: null }); // will be empty
       }
     }
 
-    // fetch candidate questions as plain JS objects
     const questions = await questionsQuery.lean().limit(500);
 
     if (!questions || questions.length === 0) {
       return res.status(404).json({ message: 'No questions available' });
     }
 
-    // Pass user and questions to adaptive service (service expects user, questions)
-    const next = adaptiveService.selectNextQuestionForUser(req.user, questions);
+    // Let adaptive service choose. If adaptiveService returns null/undefined, use fallback.
+    let next = null;
+    try {
+      if (adaptiveService && typeof adaptiveService.selectNextQuestionForUser === 'function') {
+        next = await adaptiveService.selectNextQuestionForUser(req.user, questions);
+      }
+    } catch (ae) {
+      console.error('adaptiveService.selectNextQuestionForUser error (non-fatal):', ae && ae.message ? ae.message : ae);
+      next = null;
+    }
 
-    // fallback: if service returns null, pick a random question
     const chosen = next || questions[Math.floor(Math.random() * questions.length)];
 
-    // Build a safe version to send to students: remove `answer` and `choices.correct`
+    // Build safe question: remove answer + remove choice.correct flags
     const safeQuestion = {
-      ...chosen,
-      // explicitly remove answer
-      answer: undefined,
-      // map choices to only include visible fields (text). If choices are plain strings adjust accordingly.
+      _id: chosen._id,
+      text: chosen.text,
+      type: chosen.type,
+      difficulty: chosen.difficulty,
+      concepts: chosen.concepts || [],
+      points: chosen.points || 0,
       choices: Array.isArray(chosen.choices)
-        ? chosen.choices.map(c => {
-            // if choice is string or object with text
-            if (typeof c === 'string') return { text: c };
-            return { text: c.text };
-          })
+        ? chosen.choices.map(c => (typeof c === 'string' ? { text: c } : { text: c.text }))
         : []
     };
 
