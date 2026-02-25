@@ -1,0 +1,89 @@
+openapi: 3.0.0
+info:
+  title: Adaptive E-Learn API (minimal)
+  version: "1.0.0"
+servers:
+  - url: http://localhost:5000
+paths:
+  /api/auth/login:
+    post:
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: success
+          content:
+            application/json:
+              example:
+                token: "eyJ..."
+                user:
+                  id: "603..."
+                  name: "Student One"
+                  email: "student1@example.com"
+                  role: "student"
+
+  /api/questions/next:
+    get:
+      summary: Get next adaptive question for current user
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: question
+          content:
+            application/json:
+              example:
+                _id: "q123"
+                text: "What is a variable?"
+                type: "short"
+                concepts: ["variables"]
+                difficulty: 1
+                points: 10
+
+  /api/attempts:
+    post:
+      summary: Submit an attempt
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                questionId: { type: string }
+                givenAnswer: { type: string }
+      responses:
+        "200":
+          description: attempt recorded and user updated
+          content:
+            application/json:
+              example:
+                attempt:
+                  _id: "a123"
+                  correct: true
+                  pointsEarned: 10
+                user:
+                  points: 10
+                  level: 1
+                  mastery:
+                    variables: 58
+                  unlockedBadges:
+                    - _id: "b1"
+                      name: "Getting Started"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
