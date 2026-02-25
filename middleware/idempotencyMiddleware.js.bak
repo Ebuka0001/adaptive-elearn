@@ -1,8 +1,11 @@
 ﻿/*
- safe idempotency middleware
- - non-blocking: only uses redis if connected (client.isOpen)
- - wraps redis calls in a short timeout to avoid hangs
- - falls back to no-op if redis not available
+ middleware/idempotencyMiddleware.js - safe non-blocking implementation
+
+ Behavior:
+ - If redis package is absent, or no connection is open, middleware is a no-op.
+ - If redis client is open, middleware will try to read cached response (with small timeout fallback).
+ - Uses client.isOpen check to avoid calling client.get when Redis not connected.
+ - Stores responses only if Redis is open.
 */
 let client = null;
 let isRedisAvailable = false;
@@ -14,6 +17,7 @@ try {
     console.warn('redis client error (idempotency):', err && err.message ? err.message : err);
     isRedisAvailable = false;
   });
+  // Attempt connect but do not block startup - if it fails we keep isRedisAvailable false
   (async () => {
     try {
       await client.connect();
@@ -22,24 +26,31 @@ try {
     } catch (e) {
       console.warn('redis connect failed (idempotency):', e && e.message ? e.message : e);
       isRedisAvailable = false;
+      // do not throw - middleware will act as no-op
     }
   })();
 } catch (e) {
+  // redis package not installed or require failed
   client = null;
   isRedisAvailable = false;
 }
 
 const TIMEOUT_MS = 1200;
 function timeoutPromise(p, ms) {
-  return Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+  return Promise.race([
+    p,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+  ]);
 }
 
 async function getCachedResponse(key) {
   if (!client || !isRedisAvailable || !client.isOpen) return null;
   try {
+    // call with timeout so it can't hang forever
     const raw = await timeoutPromise(client.get(key), TIMEOUT_MS);
     return raw ? JSON.parse(raw) : null;
   } catch (e) {
+    // treat any error as cache miss
     return null;
   }
 }
@@ -49,39 +60,41 @@ async function setCachedResponse(key, value, ttlSec = 60 * 60 * 24) {
   try {
     await timeoutPromise(client.setEx(key, ttlSec, JSON.stringify(value)), TIMEOUT_MS);
   } catch (e) {
-    // ignore
+    // ignore write failures
   }
 }
 
 module.exports = (req, res, next) => {
+  // Normalize header name
   const idKey = req.header('idempotency-key') || req.header('Idempotency-Key');
   if (!idKey) return next();
 
   const cacheKey = `idem:${idKey}`;
 
   (async () => {
+    // If Redis not available we skip quickly
     if (!client || !isRedisAvailable || !client.isOpen) {
-      // Redis not ready — skip quickly
       return next();
     }
 
+    // Try to get cached response (safe w/ timeout)
     const cached = await getCachedResponse(cacheKey);
     if (cached) {
       return res.status(cached.status || 200).json(cached.body);
     }
 
+    // else wrap res.json to cache future result
     const origJson = res.json.bind(res);
     res.json = async (body) => {
       try {
         await setCachedResponse(cacheKey, { status: res.statusCode || 200, body }, 60 * 60 * 24);
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) { /* ignore */ }
       return origJson(body);
     };
 
-    return next();
+    next();
   })().catch((err) => {
+    // On any internal error, don't block request - continue
     console.warn('idempotency middleware internal error:', err && err.message ? err.message : err);
     next();
   });

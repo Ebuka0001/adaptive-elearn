@@ -1,15 +1,14 @@
-// routes/attempts.js
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/authMiddleware');
-const idempotency = require('../middleware/idempotencyMiddleware');
+// idempotency temporarily disabled (we can re-enable once middleware is verified)
+// const idempotency = require('../middleware/idempotencyMiddleware');
 const attemptController = require('../controllers/attemptController');
 
 // list attempts (optional)
 router.get('/', auth, attemptController.getAttemptsForStudent);
 
-// submit attempt: protect + idempotency
-// client should send header: Idempotency-Key: <unique-value> for each distinct attempt
-router.post('/', auth, idempotency, attemptController.submitAttempt);
+// submit attempt: protect only with auth for now (idempotency middleware removed)
+router.post('/', auth, attemptController.submitAttempt);
 
 module.exports = router;
