@@ -20,6 +20,8 @@ app.use('/api/courses', require('./routes/courses'));
 app.use('/api/lessons', require('./routes/lessons'));
 app.use('/api/questions', require('./routes/questions'));
 app.use('/api/attempts', require('./routes/attempts'));
+// server.js - snippet to insert (exact)
+app.use('/api/attempts-debug', require('./routes/attempts.debug'));
 app.use('/api/gamification', require('./routes/gamification'));
 
 // start server

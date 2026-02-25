@@ -1,0 +1,14 @@
+﻿const express = require("express");
+const router = express.Router();
+const auth = require("../middleware/authMiddleware");
+// idempotency temporarily disabled while we fix the middleware
+// const idempotency = require('../middleware/idempotencyMiddleware');
+const attemptController = require("../controllers/attemptController");
+
+// list attempts (optional)
+router.get("/", auth, attemptController.getAttemptsForStudent);
+
+// submit attempt: protect (idempotency temporarily disabled)
+router.post("/", auth, attemptController.submitAttempt);
+
+module.exports = router;

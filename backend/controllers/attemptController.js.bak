@@ -1,4 +1,4 @@
-﻿// controllers/attemptController.js
+// controllers/attemptController.js
 const mongoose = require('mongoose');
 const Attempt = require('../models/Attempt');
 const Question = require('../models/Question');
@@ -7,7 +7,7 @@ const adaptiveService = require('../services/adaptiveService');
 const badgeService = require('../services/badgeService');
 const { calculateReward } = require('../services/rewardService');
 
-// helper: timeout wrapper
+// small helper to protect external service calls (timeout)
 function withTimeout(promise, ms = 4000, label = 'operation') {
   return Promise.race([
     promise,
@@ -17,11 +17,12 @@ function withTimeout(promise, ms = 4000, label = 'operation') {
 
 async function tryStartSession() {
   try {
+    if (!mongoose.connection.client || !mongoose.connection.client.topology) return null;
     const session = await mongoose.startSession();
     session.startTransaction();
     return session;
   } catch (e) {
-    return null;
+    return null; // fallback to no session
   }
 }
 
@@ -32,16 +33,17 @@ exports.submitAttempt = async (req, res) => {
     if (!questionId) return res.status(400).json({ message: 'questionId is required' });
     if (!mongoose.Types.ObjectId.isValid(questionId)) return res.status(400).json({ message: 'questionId is not a valid id' });
 
+    // attempt to start a transaction; if not available, proceed without
     const session = await tryStartSession();
 
-    // fetch question (use session where possible)
-    const question = session ? await Question.findById(questionId).session(session) : await Question.findById(questionId);
+    // Fetch question (use session if present)
+    const question = await Question.findById(questionId).session ? await Question.findById(questionId).session(session || null) : await Question.findById(questionId);
     if (!question) {
       if (session) { await session.abortTransaction(); session.endSession(); }
       return res.status(404).json({ message: 'Question not found' });
     }
 
-    // correctness check
+    // Evaluate correctness
     let correct = false;
     if (question.type === 'mcq') {
       const correctChoice = (question.choices || []).find(c => c.correct);
@@ -50,17 +52,16 @@ exports.submitAttempt = async (req, res) => {
       correct = String(question.answer || '').trim().toLowerCase() === String(givenAnswer || '').trim().toLowerCase();
     }
 
-    // load user
+    // Get (fresh) user doc
     const user = session
       ? await User.findById(req.user._id).session(session)
       : await User.findById(req.user._id);
-
     if (!user) {
       if (session) { await session.abortTransaction(); session.endSession(); }
-      return res.status(500).json({ message: 'User not found' });
+      return res.status(500).json({ message: 'User not found (during attempt)' });
     }
 
-    // calculate points
+    // calculate reward deterministically (use your rewardService)
     const pointsToAward = calculateReward({
       correct,
       difficulty: question.difficulty || 1,
@@ -69,7 +70,7 @@ exports.submitAttempt = async (req, res) => {
       streak: user.currentStreak || 0
     });
 
-    // create attempt (audit)
+    // create attempt record (audit)
     let attemptDoc;
     if (session) {
       const arr = await Attempt.create([{
@@ -92,35 +93,41 @@ exports.submitAttempt = async (req, res) => {
       });
     }
 
-    // update user (session if possible)
+    // Update user points/level/streak in an atomic-ish way:
     try {
       if (session) {
-        if (pointsToAward > 0) user.points = (user.points || 0) + pointsToAward;
-        user.level = Math.floor((user.points || 0) / 100) + 1;
+        // update fields on user doc and save in session
+        if (pointsToAward > 0) {
+          user.points = (user.points || 0) + pointsToAward;
+          user.level = Math.floor((user.points) / 100) + 1;
+        }
         user.currentStreak = correct ? ((user.currentStreak || 0) + 1) : 0;
         await user.save({ session });
       } else {
+        // fallback: use findByIdAndUpdate with $inc and $set to avoid race
         const update = {};
         if (pointsToAward > 0) update.$inc = { points: pointsToAward };
         update.$set = { currentStreak: correct ? ((user.currentStreak || 0) + 1) : 0 };
+        // compute new level from previous points + increment (best-effort)
         const newPoints = (user.points || 0) + (pointsToAward || 0);
         update.$set.level = Math.floor(newPoints / 100) + 1;
         const updated = await User.findByIdAndUpdate(user._id, update, { new: true });
-        if (updated) {
-          user.points = updated.points;
-          user.level = updated.level;
-          user.currentStreak = updated.currentStreak;
-        }
+        // copy back for response
+        user.points = updated.points;
+        user.level = updated.level;
+        user.currentStreak = updated.currentStreak;
       }
     } catch (uErr) {
+      // non-fatal: log and continue (we already have an attempt record)
       console.error('user update error (non-fatal):', uErr && uErr.message ? uErr.message : uErr);
     }
 
-    // guarded adaptive & badge calls
+    // Call adaptiveService and badgeService but guard them with timeouts.
     let awardedBadges = [];
     try {
       if (adaptiveService && typeof adaptiveService.updateMastery === 'function') {
-        await withTimeout(adaptiveService.updateMastery(user, question.concepts || [], correct, question.difficulty || 1, { session }), 3500, 'adaptive.updateMastery');
+        // pass session when available
+        await withTimeout(adaptiveService.updateMastery(user, question.concepts || [], correct, question.difficulty || 1, { session }), 4000, 'adaptive.updateMastery');
       }
     } catch (ae) {
       console.error('adaptiveService.updateMastery error (non-fatal):', ae && ae.message ? ae.message : ae);
@@ -128,21 +135,38 @@ exports.submitAttempt = async (req, res) => {
 
     try {
       if (badgeService && typeof badgeService.checkBadges === 'function') {
-        awardedBadges = await withTimeout(badgeService.checkBadges(user, { session }), 3500, 'badge.checkBadges');
+        awardedBadges = await withTimeout(badgeService.checkBadges(user, { session }), 4000, 'badge.checkBadges');
+        // ensure it's an array
         awardedBadges = Array.isArray(awardedBadges) ? awardedBadges : [];
       }
     } catch (be) {
       console.error('badgeService.checkBadges error (non-fatal):', be && be.message ? be.message : be);
+      awardedBadges = [];
     }
 
+    // commit if using session
     if (session) {
-      try { await session.commitTransaction(); } catch (e) { console.error('commit failed:', e && e.message ? e.message : e); try { await session.abortTransaction(); } catch(_){} }
-      session.endSession();
+      try {
+        await session.commitTransaction();
+      } catch (commitErr) {
+        console.error('commit transaction failed:', commitErr && commitErr.message ? commitErr.message : commitErr);
+        try { await session.abortTransaction(); } catch (e) { /* ignore */ }
+      } finally {
+        session.endSession();
+      }
     }
 
+    // return result with consistent shape
     return res.json({
       attempt: attemptDoc,
-      user: { id: user._id, name: user.name, points: user.points, level: user.level, mastery: user.mastery, badges: user.badges },
+      user: {
+        id: user._id,
+        name: user.name,
+        points: user.points,
+        level: user.level,
+        mastery: user.mastery,
+        badges: user.badges
+      },
       awardedBadges
     });
   } catch (err) {
